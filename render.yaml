@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: chaos-relay
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn cloud_relay:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BRIDGE_SECRET
+        value: 60214a27a9f1ee39361b70b3fa8c98d6
+      - key: REQUEST_TIMEOUT
+        value: 15
