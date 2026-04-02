@@ -1,7 +1,7 @@
 """
 WebSocket Relay Server (CLOUD)
 ================================
-Runs in the cloud (Railway / Render / Fly.io / VPS).
+Runs on Render / Railway / Fly.io.
 Accepts a persistent WebSocket from your local bridge,
 then forwards customer HTTP requests through it.
 
@@ -9,16 +9,13 @@ Architecture:
   [customers] → HTTP → [cloud_relay.py] → WebSocket → [ws_bridge.py (local)] → [key]
 
 Install:
-    pip install fastapi uvicorn websockets python-dotenv
+    pip install fastapi uvicorn[standard] python-dotenv
 
-Run (dev):
-    uvicorn cloud_relay:app --host 0.0.0.0 --port 7000
-
-Run (prod):
-    uvicorn cloud_relay:app --host 0.0.0.0 --port 7000 --workers 1
+Start command (Render):
+    uvicorn cloud_relay:app --host 0.0.0.0 --port $PORT
 
 Env vars:
-    BRIDGE_SECRET   — must match ws_bridge.py --secret
+    BRIDGE_SECRET   — must match ws_bridge.py / launcher.py
     REQUEST_TIMEOUT — seconds to wait for bridge response (default: 15)
 """
 
@@ -27,7 +24,6 @@ import json
 import logging
 import os
 import secrets
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
@@ -39,13 +35,8 @@ from pydantic import BaseModel
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-BRIDGE_SECRET   = os.getenv("BRIDGE_SECRET", "")
+BRIDGE_SECRET   = os.getenv("BRIDGE_SECRET", "60214a27a9f1ee39361b70b3fa8c98d6")
 REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "15"))
-
-if not BRIDGE_SECRET:
-    BRIDGE_SECRET = secrets.token_urlsafe(32)
-    print(f"[WARN] BRIDGE_SECRET not set — using random: {BRIDGE_SECRET}")
-    print("       Set the same value in ws_bridge.py --secret\n")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,6 +44,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S"
 )
 log = logging.getLogger("CloudRelay")
+log.info(f"BRIDGE_SECRET set: {BRIDGE_SECRET[:8]}…")
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
@@ -70,26 +62,26 @@ app.add_middleware(
 class BridgeManager:
     """
     Manages the single persistent WebSocket from the local bridge.
-    Multiplexes many concurrent HTTP requests over it using request_id correlation.
+    Multiplexes concurrent HTTP requests using request_id correlation.
     """
 
     def __init__(self):
-        self.ws:         Optional[WebSocket] = None
-        self.pending:    dict[str, asyncio.Future] = {}  # request_id → Future
-        self._send_lock  = asyncio.Lock()
-        self.connected   = False
-        self.connected_at: Optional[str] = None
-        self.key_bits:   Optional[int] = None
-        self.req_count   = 0
+        self.ws:              Optional[WebSocket] = None
+        self.pending:         dict[str, asyncio.Future] = {}
+        self._send_lock       = asyncio.Lock()
+        self.connected        = False
+        self.connected_at:    Optional[str] = None
+        self.key_bits:        Optional[int] = None
+        self.req_count        = 0
 
     async def connect(self, ws: WebSocket):
         if self.connected:
             log.warning("New bridge connection replacing existing one")
             await self.disconnect_current()
-        self.ws          = ws
-        self.connected   = True
+        self.ws           = ws
+        self.connected    = True
         self.connected_at = datetime.now(timezone.utc).isoformat()
-        log.info("Bridge connected ✓")
+        log.info("Bridge connected")
 
     async def disconnect_current(self):
         if self.ws:
@@ -109,28 +101,23 @@ class BridgeManager:
         self.pending.clear()
 
     async def send_request(self, op: str, payload: dict) -> dict:
-        """Send a request to the local bridge and await its response."""
         if not self.connected or not self.ws:
-            raise HTTPException(503, "Bridge offline — local machine not connected")
+            raise HTTPException(503, "Bridge offline — start launcher.py on your local machine")
 
-        request_id          = str(uuid.uuid4())
-        payload["request_id"] = request_id
-        payload["op"]         = op
+        request_id             = str(uuid.uuid4())
+        payload["request_id"]  = request_id
+        payload["op"]          = op
 
         loop = asyncio.get_event_loop()
         fut  = loop.create_future()
         self.pending[request_id] = fut
 
-        msg = json.dumps({"type": "request", "payload": payload})
-
         try:
             async with self._send_lock:
-                await self.ws.send_text(msg)
+                await self.ws.send_text(json.dumps({"type": "request", "payload": payload}))
             self.req_count += 1
-
             result = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
             return result
-
         except asyncio.TimeoutError:
             self.pending.pop(request_id, None)
             raise HTTPException(504, "Bridge timeout — local machine did not respond")
@@ -139,13 +126,11 @@ class BridgeManager:
             raise HTTPException(502, f"Bridge error: {e}")
 
     def resolve_response(self, request_id: str, payload: dict):
-        """Called when a response arrives from the bridge."""
         fut = self.pending.pop(request_id, None)
         if fut and not fut.done():
             fut.set_result(payload)
 
     async def receive_loop(self, ws: WebSocket):
-        """Read messages from the bridge WebSocket continuously."""
         try:
             async for raw in ws.iter_text():
                 try:
@@ -168,10 +153,10 @@ class BridgeManager:
                         self.resolve_response(request_id, payload)
 
                 elif msg_type == "pong":
-                    pass  # keepalive
+                    pass
 
                 else:
-                    log.debug(f"Unknown bridge message type: {msg_type}")
+                    log.debug(f"Unknown message type: {msg_type}")
 
         except WebSocketDisconnect:
             pass
@@ -183,21 +168,21 @@ class BridgeManager:
 
 bridge = BridgeManager()
 
-# ── WebSocket endpoint (for local bridge) ──────────────────────────────────────
+# ── WebSocket endpoint ─────────────────────────────────────────────────────────
 
 @app.websocket("/bridge")
 async def websocket_bridge(ws: WebSocket):
-    """
-    Persistent WebSocket for the local ws_bridge.py to connect to.
-    Authenticated via X-Bridge-Secret header.
-    """
+    # MUST accept before doing anything else — including auth checks.
+    # Closing before accept causes HTTP 404 on the client side.
+    await ws.accept()
+
     secret = ws.headers.get("X-Bridge-Secret", "")
     if BRIDGE_SECRET and secret != BRIDGE_SECRET:
+        log.warning(f"Bridge rejected — wrong secret (got: {secret[:8]}…)")
         await ws.close(code=4003, reason="Invalid bridge secret")
-        log.warning("Bridge connection rejected — invalid secret")
         return
 
-    await ws.accept()
+    log.info("Bridge WebSocket accepted")
     await bridge.connect(ws)
 
     try:
@@ -206,7 +191,8 @@ async def websocket_bridge(ws: WebSocket):
         if bridge.ws is ws:
             await bridge.disconnect_current()
 
-# ── HTTP endpoints (for customers via app.py) ──────────────────────────────────
+
+# ── HTTP endpoints (called by app.py) ─────────────────────────────────────────
 
 class EncryptRequest(BaseModel):
     plaintext: str
@@ -215,28 +201,24 @@ class DecryptRequest(BaseModel):
     ciphertext: str
     nonce:      str
 
-def relay_headers(request: Request):
-    """Pass-through auth — app.py already validated the customer key."""
-    # app.py sets X-Relay-Token when calling us
+def relay_auth(request: Request):
     token = request.headers.get("X-Relay-Token", "")
     if BRIDGE_SECRET and token != BRIDGE_SECRET:
         raise HTTPException(403, "Invalid relay token")
 
 
 @app.get("/relay/status")
-async def relay_status(request: Request, _=Depends(relay_headers)):
-    result = await bridge.send_request("status", {})
-    return result
+async def relay_status(request: Request, _=Depends(relay_auth)):
+    return await bridge.send_request("status", {})
 
 
 @app.get("/relay/key_info")
-async def relay_key_info(request: Request, _=Depends(relay_headers)):
-    result = await bridge.send_request("key_info", {})
-    return result
+async def relay_key_info(request: Request, _=Depends(relay_auth)):
+    return await bridge.send_request("key_info", {})
 
 
 @app.post("/relay/encrypt")
-async def relay_encrypt(body: EncryptRequest, request: Request, _=Depends(relay_headers)):
+async def relay_encrypt(body: EncryptRequest, request: Request, _=Depends(relay_auth)):
     result = await bridge.send_request("encrypt", {"plaintext": body.plaintext})
     if result.get("status", 200) >= 400:
         raise HTTPException(result["status"], result.get("error"))
@@ -244,7 +226,7 @@ async def relay_encrypt(body: EncryptRequest, request: Request, _=Depends(relay_
 
 
 @app.post("/relay/decrypt")
-async def relay_decrypt(body: DecryptRequest, request: Request, _=Depends(relay_headers)):
+async def relay_decrypt(body: DecryptRequest, request: Request, _=Depends(relay_auth)):
     result = await bridge.send_request("decrypt", {
         "ciphertext": body.ciphertext,
         "nonce":      body.nonce,
@@ -254,17 +236,17 @@ async def relay_decrypt(body: DecryptRequest, request: Request, _=Depends(relay_
     return result
 
 
-# ── Health & metrics ───────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
     return {
-        "status":       "ok",
-        "bridge_online": bridge.connected,
-        "key_bits":      bridge.key_bits,
-        "requests_proxied": bridge.req_count,
-        "connected_at":  bridge.connected_at,
-        "timestamp":     datetime.now(timezone.utc).isoformat(),
+        "status":            "ok",
+        "bridge_online":     bridge.connected,
+        "key_bits":          bridge.key_bits,
+        "requests_proxied":  bridge.req_count,
+        "connected_at":      bridge.connected_at,
+        "timestamp":         datetime.now(timezone.utc).isoformat(),
     }
 
 
